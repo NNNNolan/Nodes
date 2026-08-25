@@ -25,13 +25,29 @@ import html as _html
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+_BASE = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_CONFIG_FILE = os.path.join(_BASE, "config.local.json")
+
+
+def _load_local_config():
+    if not os.path.exists(_LOCAL_CONFIG_FILE):
+        return {}
+    try:
+        with open(_LOCAL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[!] 读取本地配置失败: {e}")
+        return {}
+
+
+_LOCAL_CONFIG = _load_local_config()
+
 # ── 配置 ────────────────────────────────────────────────
 # YYDS Mail（临时邮箱）
 YYDS_BASE = "https://maliapi.215.im/v1"
-YYDS_KEY = os.environ.get("YYDS_API_KEY", "").strip()
-YYDS_DOMAIN = os.environ.get("YYDS_DOMAIN", "").strip()
-
-_BASE = os.path.dirname(os.path.abspath(__file__))
+YYDS_KEY = str(_LOCAL_CONFIG.get("yyds_api_key") or os.environ.get("YYDS_API_KEY", "")).strip()
+YYDS_DOMAIN = str(_LOCAL_CONFIG.get("yyds_domain") or os.environ.get("YYDS_DOMAIN", "")).strip()
 
 # ProxyScrape dashboard
 PS_BASE = "https://dashboard.proxyscrape.com"
@@ -44,9 +60,10 @@ PS_SIGNUP_PAGE = f"{PS_BASE}/v2/sign-up"
 PS_SITEKEY = "0x4AAAAAAAFWUVCKyusT9T8r"
 
 # turnstilePatch 扩展：默认读取项目内目录，也可通过环境变量覆盖
-EXTENSION_PATH = os.environ.get(
-    "TURNSTILE_EXTENSION_PATH",
-    os.path.join(_BASE, "turnstilePatch"),
+EXTENSION_PATH = str(
+    _LOCAL_CONFIG.get("turnstile_extension_path")
+    or os.environ.get("TURNSTILE_EXTENSION_PATH")
+    or os.path.join(_BASE, "turnstilePatch")
 ).strip()
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -152,15 +169,24 @@ if(chk&&!chk.checked) chk.click();
 return 'filled';
 """
 
-# 读 token：优先隐藏字段，其次 turnstile.getResponse()
-_GET_TOKEN_JS = r"""
+# 一次读全 widget 状态（供轮询检测用，不盲等）：页面/API/input/iframe/token
+_STATE_JS = r"""
 try{
-  var v=String((document.querySelector('input[name="cf-turnstile-response"]')||{}).value||'').trim();
-  if(v) return v;
-  if(window.turnstile && typeof turnstile.getResponse==='function')
-    return String(turnstile.getResponse()||'').trim();
-  return '';
-}catch(e){ return ''; }
+  var inp=document.querySelector('input[name="cf-turnstile-response"]');
+  var token=inp?String(inp.value||'').trim():'';
+  if(!token && window.turnstile && typeof turnstile.getResponse==='function'){
+    try{ token=String(turnstile.getResponse()||'').trim(); }catch(e){}
+  }
+  var ifr=document.querySelector('iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"]');
+  return JSON.stringify({
+    ready: document.readyState==='complete',
+    hasApi: !!(window.turnstile && typeof turnstile.render==='function'),
+    hasInput: !!inp,
+    hasIframe: !!ifr,
+    tokenLen: token.length,
+    token: token.length>=80 ? token : ''
+  });
+}catch(e){ return JSON.stringify({err:String(e)}); }
 """
 
 # 注入进 turnstile iframe，伪装真实鼠标屏幕坐标（反自动化检测）
@@ -171,10 +197,44 @@ Object.defineProperty(MouseEvent.prototype,'screenX',{value:ri(800,1200)});
 Object.defineProperty(MouseEvent.prototype,'screenY',{value:ri(400,700)});
 """
 
+# 兜底：页面自带组件半挂载不出 iframe 时，用已知 sitekey 自己 render 一个干净 widget
+_RENDER_JS = r"""
+try{
+  if(!window.turnstile || typeof turnstile.render!=='function') return 'no-api';
+  var c=document.getElementById('__ps_ts');
+  if(c && c.getAttribute('data-done')) return 'already';
+  if(!c){
+    c=document.createElement('div'); c.id='__ps_ts';
+    c.style.cssText='position:fixed;bottom:8px;right:8px;z-index:2147483647';
+    document.body.appendChild(c);
+  }
+  window.__ps_wid=turnstile.render(c,{
+    sitekey: arguments[0],
+    callback: function(t){ window.__ps_token=t; }
+  });
+  c.setAttribute('data-done','1');
+  return 'rendered:'+window.__ps_wid;
+}catch(e){ return 'err:'+String(e); }
+"""
 
-def solve_turnstile(headless=False, timeout=90):
-    """打开真实 sign-up 页，用 DrissionPage 的 shadow_root API 逐层钻进
-    closed shadow DOM 点 checkbox，拿到 cf-turnstile-response。"""
+
+def _read_state(tab):
+    """读一次 widget 状态，返回 dict；解析失败返回空 dict。"""
+    try:
+        raw = tab.run_js(_STATE_JS)
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def solve_turnstile(headless=False, timeout=120):
+    """打开真实 sign-up 页，全程检测状态（不盲等固定时间）：
+      1) 等页面 ready 且 window.turnstile API 就绪
+      2) 填占位表单 → 检测 cf-turnstile-response input 挂载
+      3) 若页面组件半挂载迟迟不出 challenge iframe，用已知 sitekey 自己 render 兜底
+      4) 检测到 challenge iframe 后进 iframe 点 checkbox（每步都检测，出来才动手）
+      5) 轮询直到 token（≥80）出现
+    每一步独立检测 + 日志，卡在哪一步一目了然。"""
     from DrissionPage import Chromium, ChromiumOptions
 
     opts = ChromiumOptions()
@@ -200,34 +260,68 @@ def solve_turnstile(headless=False, timeout=90):
         except Exception:
             pass
     try:
+        deadline = time.time() + timeout
         log("浏览器打开 sign-up 页…")
         tab.get(PS_SIGNUP_PAGE)
-        time.sleep(5)
 
-        # 填占位表单触发 widget 挂载（不填不 render）
-        tab.run_js(_FILL_JS)
-        log("表单已填，预热 Turnstile…")
-        time.sleep(2)
-        try:
-            tab.run_js("try{if(window.turnstile&&turnstile.reset)turnstile.reset()}catch(e){}")
-        except Exception:
-            pass
-
-        deadline = time.time() + timeout
+        # ① 等页面 ready 且 turnstile API 就绪（网络慢，检测到才继续，不盲等）
         while time.time() < deadline:
-            token = str(tab.run_js(_GET_TOKEN_JS) or "").strip()
-            if len(token) >= 80:
-                log(f"Turnstile 通过，token 长度={len(token)}")
-                return token
+            st = _read_state(tab)
+            if st.get("ready") and st.get("hasApi"):
+                break
+            time.sleep(0.5)
+        else:
+            raise TimeoutError("等待页面/turnstile API 就绪超时")
+        log("页面就绪，turnstile API 已加载")
 
-            # 逐层进 shadow DOM 点 checkbox
-            ci = tab.ele("@name=cf-turnstile-response", timeout=2)
-            if ci:
-                try:
-                    wrapper = ci.parent()
-                    iframe = wrapper.shadow_root.ele("tag:iframe", timeout=2)
-                except Exception:
-                    iframe = None
+        # ② 填占位表单，然后检测 cf-turnstile-response input 是否挂载（不 sleep 后瞎找）
+        tab.run_js(_FILL_JS)
+        input_seen = False
+        while time.time() < deadline:
+            st = _read_state(tab)
+            if st.get("token"):                      # 极快场景：填完直接就有 token
+                log(f"Turnstile 通过（预热即得），token 长度={st['tokenLen']}")
+                return st["token"]
+            if st.get("hasInput"):
+                input_seen = True
+                break
+            time.sleep(0.5)
+        if not input_seen:
+            raise TimeoutError("等待 cf-turnstile-response 挂载超时")
+        log("检测到 turnstile input 已挂载")
+
+        # ③ 短暂检测原生 challenge iframe 是否自行出现；若半挂载不出，则自己 render 兜底
+        render_deadline = min(deadline, time.time() + 12)
+        while time.time() < render_deadline:
+            st = _read_state(tab)
+            if st.get("token"):
+                log(f"Turnstile 通过，token 长度={st['tokenLen']}")
+                return st["token"]
+            if st.get("hasIframe"):
+                break
+            time.sleep(0.6)
+        if not _read_state(tab).get("hasIframe"):
+            # 原生组件半挂载没出 iframe —— 用已知 sitekey 自己 render 一个干净 widget
+            r = tab.run_js(_RENDER_JS, PS_SITEKEY)
+            log(f"原生 widget 未出 iframe，显式 render 兜底: {r}")
+
+        # ④ 检测到 challenge iframe 才进去点 checkbox；⑤ 轮询 token
+        while time.time() < deadline:
+            st = _read_state(tab)
+            if st.get("token"):
+                log(f"Turnstile 通过，token 长度={st['tokenLen']}")
+                return st["token"]
+            # 显式 render 的回调 token
+            try:
+                cb = str(tab.run_js("return String(window.__ps_token||'')") or "").strip()
+                if len(cb) >= 80:
+                    log(f"Turnstile 通过（render 回调），token 长度={len(cb)}")
+                    return cb
+            except Exception:
+                pass
+
+            if st.get("hasIframe"):
+                iframe = tab.ele("tag:iframe@|src:challenges.cloudflare.com@|src:turnstile", timeout=2)
                 if iframe:
                     try:
                         iframe.run_js(_SCREEN_INJECT_JS)
@@ -240,8 +334,8 @@ def solve_turnstile(headless=False, timeout=90):
                             btn.click()
                     except Exception:
                         pass
-            time.sleep(1.2)
-        raise TimeoutError("Turnstile 求解超时")
+            time.sleep(1.0)
+        raise TimeoutError("Turnstile 求解超时（已检测到各阶段状态，token 未生成）")
     finally:
         try:
             browser.quit()
@@ -324,12 +418,19 @@ def fetch_proxies(access_token, account_id):
     return user, pwd, lst
 
 
+def _format_proxy_url(user, pwd, ip):
+    raw = f"{user}:{pwd}@{ip}".strip()
+    if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.I):
+        return raw
+    return f"http://{raw}"
+
+
 def save_proxies(user, pwd, proxies, path):
-    """追加写入本轮代理文件，格式 user:pass@ip:port（可直接喂给多数工具）。"""
+    """追加写入本轮代理文件，格式 http://user:pass@ip:port。"""
     with _file_lock:
         with open(path, "a", encoding="utf-8") as f:
             for ip in proxies:
-                f.write(f"{user}:{pwd}@{ip}\n")
+                f.write(f"{_format_proxy_url(user, pwd, ip)}\n")
 
 
 # ── 单个账号注册（并发 worker）───────────────────────────

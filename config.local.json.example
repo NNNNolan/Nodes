@@ -1,0 +1,5 @@
+{
+  "yyds_api_key": "在此填入你的 YYDS Mail API Key",
+  "yyds_domain": "",
+  "turnstile_extension_path": ""
+}

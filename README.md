@@ -30,23 +30,43 @@ https://github.com/Resinat/Resin
 
 - Python 3.10+
 - Chromium/Chrome
-- `turnstilePatch` 浏览器扩展
+- `turnstilePatch` 浏览器扩展（已随仓库提供，见项目内 `turnstilePatch/`，开箱即用）
 
 安装 Python 依赖：
 
 ```bash
-python -m pip install requests DrissionPage PyJWT
+python -m pip install -r requirements.txt
 ```
 
 ## 本地隐私配置
 
-项目不会在源码中保存 YYDS Key、自有域名或本机绝对路径。运行前通过环境变量配置：
+项目不会在源码中保存 YYDS Key、自有域名或本机绝对路径。有两种配置方式，二选一：
+
+**方式一：配置文件（推荐，最省事）**
+
+复制模板并填入你自己的 Key：
+
+```bash
+cp config.local.json.example config.local.json
+```
+
+然后编辑 `config.local.json`：
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `yyds_api_key` | 是 | YYDS Mail API Key |
+| `yyds_domain` | 否 | 已在 YYDS 验证的自有域名；留空则由 YYDS 选择域名 |
+| `turnstile_extension_path` | 否 | 留空即用仓库自带的 `turnstilePatch/`；仅当想换成本机其它目录时才填 |
+
+`config.local.json` 已被 `.gitignore` 排除，不会进入仓库。
+
+**方式二：环境变量（会覆盖配置文件同名项）**
 
 | 环境变量 | 必需 | 说明 |
 |----------|------|------|
 | `YYDS_API_KEY` | 是 | YYDS Mail API Key |
-| `YYDS_DOMAIN` | 否 | 已在 YYDS 验证的自有域名；留空则由 YYDS 选择域名 |
-| `TURNSTILE_EXTENSION_PATH` | 是 | 本机 `turnstilePatch` 目录 |
+| `YYDS_DOMAIN` | 否 | 已验证的自有域名；留空则由 YYDS 选择 |
+| `TURNSTILE_EXTENSION_PATH` | 否 | 留空即用仓库自带扩展；仅覆盖为本机其它目录时才填 |
 | `PYTHON_EXE` | 否 | `启动注册.bat` 使用的 Python；默认使用 PATH 中的 `python` |
 
 PowerShell 当前窗口配置示例：
@@ -54,7 +74,6 @@ PowerShell 当前窗口配置示例：
 ```powershell
 $env:YYDS_API_KEY = "YOUR_YYDS_API_KEY"
 $env:YYDS_DOMAIN = ""
-$env:TURNSTILE_EXTENSION_PATH = "D:\path\to\turnstilePatch"
 python .\proxyscrape_register.py
 ```
 
