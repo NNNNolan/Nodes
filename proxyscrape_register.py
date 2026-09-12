@@ -56,6 +56,9 @@ PS_LOGIN = f"{PS_BASE}/v2/v4/account/auth/login"
 PS_ME = f"{PS_BASE}/v2/v4/account/auth/me"
 PS_VERIFY_EMAIL = f"{PS_BASE}/v2/v4/account/verify-email"
 PS_RESEND = f"{PS_BASE}/v2/v4/account/reset-verification-code"
+# 2025-09 上游改动：Premium trial 不再随邮箱验证自动激活，需要显式领取
+PS_TRIAL_ELIGIBILITY = f"{PS_BASE}/v2/v4/account/premium/trial-eligibility"
+PS_CLAIM_TRIAL = f"{PS_BASE}/v2/v4/account/premium/claim-trial"
 PS_SIGNUP_PAGE = f"{PS_BASE}/v2/sign-up"
 PS_SITEKEY = "0x4AAAAAAAFWUVCKyusT9T8r"
 
@@ -388,9 +391,27 @@ def whoami(session, access_token):
 
 
 # ── 拉取免费 datacenter 代理 ────────────────────────────
+def claim_premium_trial(session, access_token):
+    """领取 Premium trial（2025-09 上游改动后必须显式调用，否则不生成子账户）。
+    返回 claim 响应里的 account_id（可能为空，后续以 /me 为准）。"""
+    h = {"Authorization": f"Bearer {access_token}"}
+    r = session.get(PS_TRIAL_ELIGIBILITY, headers=h, timeout=25)
+    log(f"trial-eligibility: {r.status_code} {r.text[:120]}")
+    if r.ok and r.json().get("claimed"):
+        log("trial 已领取过，跳过 claim")
+        return None
+    r = session.post(PS_CLAIM_TRIAL, headers=h, timeout=30)
+    log(f"claim-trial: {r.status_code} {r.text[:160]}")
+    if r.ok:
+        data = r.json()
+        if data.get("success"):
+            log("Premium trial 激活成功")
+            return data.get("account_id")
+    return None
+
+
 def fetch_proxies(access_token, account_id):
-    """注册后 Premium trial 自带 100 个 datacenter 共享代理。
-    从 overview 拿账密，从 proxy-list 端点拿 ip:port 列表。"""
+    """trial 激活后从 overview 拿账密，从 proxy-list 端点拿 ip:port 列表。"""
     h = {"Authorization": f"Bearer {access_token}", "User-Agent": UA, "Origin": PS_BASE}
 
     def _overview():
@@ -456,20 +477,37 @@ def _register_once(headless, node_file):
     except Exception as e:
         log(f"[!] 邮箱验证环节: {e}（账号已注册，token 有效）")
 
-    # 拉免费 datacenter 代理（Premium trial 自带 100 个）——须先验证邮箱才激活
+    # 拉免费 datacenter 代理（Premium trial 100 个）——先验证邮箱，再显式领取 trial
     p_user = p_pass = ""
     p_count = 0
     if not verified:
-        log("邮箱未验证，trial 未激活，跳过拉代理")
+        log("邮箱未验证，trial 无法激活，跳过拉代理")
     else:
         try:
-            subs = userdata.get("associatedSubaccounts") or []
-            aid = subs[0].get("AccountID") if subs else None
-            if aid:
-                p_user, p_pass, plist = fetch_proxies(access_token, aid)
-                save_proxies(p_user, p_pass, plist, node_file)
-                p_count = len(plist)
-                log(f"拉取代理 {p_count} 个")
+            # ① 显式领取 Premium trial（上游 2025-09 改动：不再自动激活）
+            claimed_aid = claim_premium_trial(session, access_token)
+
+            # ② 拿子账户 ID：优先 claim 返回的 account_id，其次 /me，最后旧字段兜底
+            aid = claimed_aid
+            if not aid:
+                me = session.post(PS_ME, headers={"Authorization": f"Bearer {access_token}"},
+                                  timeout=25)
+                if me.ok:
+                    subs = me.json().get("associatedSubaccounts") or []
+                    ds = [x for x in subs if "datacenter" in str(x.get("AccountType", ""))]
+                    if ds:
+                        aid = ds[0].get("AccountID")
+            if not aid:
+                subs = userdata.get("associatedSubaccounts") or []
+                aid = subs[0].get("AccountID") if subs else None
+            if not aid:
+                raise RuntimeError("trial 领取后仍未拿到子账户 ID")
+
+            # ③ 拉代理列表
+            p_user, p_pass, plist = fetch_proxies(access_token, aid)
+            save_proxies(p_user, p_pass, plist, node_file)
+            p_count = len(plist)
+            log(f"拉取代理 {p_count} 个")
         except Exception as e:
             log(f"[!] 拉代理失败: {e}")
 
